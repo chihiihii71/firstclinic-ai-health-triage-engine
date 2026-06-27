@@ -1,0 +1,6 @@
+py310_venv/
+__pycache__/
+2.env
+.env
+*.pyc
+*.csv
