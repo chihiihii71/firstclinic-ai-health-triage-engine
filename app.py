@@ -1,30 +1,30 @@
-# app.py
 import os
 import joblib
 import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional, List
 from dotenv import load_dotenv
-
-# Use the correct import path for the SDK
-import google.generativeai as genai
-
-# NEW IMPORT: Necessary to catch the specific "Quota Exceeded" error
-from google.api_core.exceptions import ResourceExhausted
+from google import genai
+from huggingface_hub import hf_hub_download
 
 # -----------------------------
-# 1. Load environment variables and configure Gemini
+# 1. Load environment variables
 # -----------------------------
-load_dotenv()  # Load .env variables
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+load_dotenv()
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # -----------------------------
 # 2. Load trained model bundle
 # -----------------------------
-MODEL_PATH = "health_risk_deep_model.joblib"
-model_bundle = joblib.load(MODEL_PATH)
-
+model_path = hf_hub_download(
+    repo_id="Jaoooooo9/firstclinic-triage-dl-model",
+    filename="health_risk_deep_model.joblib",
+    token=os.getenv("HF_TOKEN")
+)
+model_bundle = joblib.load(model_path)
 model_pipeline = model_bundle["pipeline"]
 label_encoder = model_bundle["label_encoder"]
 feature_columns = model_bundle["feature_columns"]
@@ -33,7 +33,6 @@ feature_columns = model_bundle["feature_columns"]
 # 3. Initialize FastAPI app
 # -----------------------------
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,9 +44,14 @@ app.add_middleware(
 # -----------------------------
 # 4. Request schema
 # -----------------------------
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     message: str
-    vitals: dict | None = None
+    vitals: Optional[dict] = None
+    history: Optional[List[HistoryMessage]] = []
 
 # -----------------------------
 # 5. Predict risk function
@@ -65,54 +69,70 @@ def predict_risk(vitals: dict) -> str:
 async def chat_endpoint(req: ChatRequest):
     user_message = req.message
     vitals = req.vitals
+    history = req.history or []
 
-    prompt = f"The patient says: '{user_message}'. "
+    # Build conversation history context
+    conversation_context = ""
+    if history:
+        conversation_context = "Previous conversation:\n"
+        for msg in history[-6:]:  # last 6 messages for context
+            role = "Patient" if msg.role == "user" else "Assistant"
+            conversation_context += f"{role}: {msg.content}\n"
+        conversation_context += "\n"
 
+    # Build current prompt
     if vitals:
         try:
             risk = predict_risk(vitals)
-            prompt += (
+            prompt = (
+                f"{conversation_context}"
+                f"The patient's current message: '{user_message}'. "
                 f"Their vital signs are {vitals}. "
                 f"The predicted health risk level is '{risk}'. "
-                "Provide empathetic, clear, and helpful medical guidance based on this information."
+                "You are a medical AI assistant. Provide empathetic, clear, and helpful "
+                "medical guidance based on the risk level and vital signs. "
+                "If risk is High, strongly advise immediate medical attention. "
+                "If Medium, advise scheduling a doctor visit soon. "
+                "If Low, provide reassurance and healthy lifestyle tips. "
+                "Always remind the patient this is AI guidance, not a substitute for professional medical advice."
             )
         except Exception as e:
-            prompt += (
-                f"Error predicting risk from vitals. "
-                f"Provide general health guidance anyway. [Error: {str(e)}]"
+            prompt = (
+                f"{conversation_context}"
+                f"The patient says: '{user_message}'. "
+                f"There was an error processing vital signs: {str(e)}. "
+                "Provide general health guidance with empathy."
             )
     else:
-        prompt += (
-            "No vital signs provided. "
-            "Provide general health or lifestyle suggestions with empathy."
+        prompt = (
+            f"{conversation_context}"
+            f"The patient says: '{user_message}'. "
+            "You are a compassionate medical AI assistant. "
+            "Provide helpful general health information, lifestyle suggestions, "
+            "or answer health-related questions with empathy and clarity. "
+            "Always remind the patient to consult a real doctor for medical decisions."
         )
 
-    model_llm = genai.GenerativeModel("models/gemini-2.5-flash")
-
-    # --- ERROR HANDLING FIX STARTS HERE ---
     try:
-        # Try to generate content
-        response = model_llm.generate_content(prompt)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
         return {"reply": response.text}
 
-    except ResourceExhausted:
-        # This block runs ONLY if the quota is exceeded
-        print("Error: Gemini API Quota Exceeded")
-        return {
-            "reply": "I apologize, but I am currently overloaded with requests (Quota Exceeded). Please try again in a few minutes."
-        }
-
     except Exception as e:
-        # This catches any other unexpected errors
-        print(f"Error calling Gemini API: {e}")
+        if "quota" in str(e).lower() or "429" in str(e):
+            return {
+                "reply": "I am currently experiencing high demand. Please try again in a few minutes."
+            }
+        print(f"Gemini API Error: {e}")
         return {
-            "reply": "I'm having trouble connecting to the AI service right now. Please try again later."
+            "reply": "I am having trouble connecting to the AI service. Please check your connection and try again."
         }
-    # --- ERROR HANDLING FIX ENDS HERE ---
 
 # -----------------------------
-# 7. Root endpoint for testing
+# 7. Root endpoint
 # -----------------------------
 @app.get("/")
 def root():
-    return {"message": "Chatbot backend is running successfully!"}
+    return {"message": "FirstClinic API is running successfully!"}
