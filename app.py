@@ -136,3 +136,4 @@ async def chat_endpoint(req: ChatRequest):
 @app.get("/")
 def root():
     return {"message": "FirstClinic API is running successfully!"}
+
